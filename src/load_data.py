@@ -14,8 +14,7 @@ piece_to_int = {
 def fen_to_sequence(fen):
     parts = fen.split()
     fen_board = parts[0]
-    side_to_move = parts[1]
-    castling_availability = parts[2]
+
     sequence = []
 
     rows = fen_board.split('/')
@@ -25,19 +24,6 @@ def fen_to_sequence(fen):
                 sequence.extend([piece_to_int['.']] * int(char))
             else:
                 sequence.append(piece_to_int[char])
-
-    sequence.append(1 if side_to_move == 'w' else 0)
-
-    castling_vector = [0, 0, 0, 0]  # K, Q, k, q
-    if 'K' in castling_availability:
-        castling_vector[0] = 1
-    if 'Q' in castling_availability:
-        castling_vector[1] = 1
-    if 'k' in castling_availability:
-        castling_vector[2] = 1
-    if 'q' in castling_availability:
-        castling_vector[3] = 1
-    sequence.extend(castling_vector)
 
     return sequence
 
@@ -75,4 +61,5 @@ class ChessDataset(Dataset):
 
     def __getitem__(self, idx):
         sequence = fen_to_sequence(self.fens[idx])
-        return torch.tensor(sequence, dtype=torch.long), torch.tensor(self.evals[idx], dtype=torch.float32)
+        evaluation = self.evals[idx]
+        return torch.tensor(sequence, dtype=torch.long), torch.tensor(evaluation, dtype=torch.float32)
