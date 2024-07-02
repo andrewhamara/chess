@@ -72,13 +72,13 @@ def train(model, dataloader, criterion, optimizer, num_epochs=10):
         print(f'Epoch [{epoch+1}/{num_epochs}], Average Loss: {total_loss / len(dataloader):.4f}')
 
 if __name__ == '__main__':
-    file_path = 'json_file_Path'
+    file_path = '/Volumes/andy/splits/chunk_1.json'
     evals, fens = get_data(file_path)
     dataset = ChessDataset(evals, fens)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
 
     embedding_dim = 1280
-    model = ChessTransformer(embedding_dim=embedding_dim, max_len=64)
+    model = ChessTransformer(embedding_dim=embedding_dim, max_len=100)
     criterion = ContrastiveLoss(margin=1.0)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
