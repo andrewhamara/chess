@@ -95,9 +95,10 @@ def train(model, dataloader, dataset, criterion, optimizer, num_epochs=10, num_c
                 total_loss += loss.item()
                 print('did a sequence')
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
+    torch.save(model.state_dict(), 'chess_transformer_model.pth')
 
 if __name__ == '__main__':
-    file_path = 'path_to_json_here'
+    file_path = '/Volumes/andy/splits/chunk_1.json'
     evals, fens = get_data(file_path)
     dataset = ChessDataset(evals, fens)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
