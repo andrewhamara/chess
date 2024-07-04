@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import torch
+#torch.cuda.empty_cache()
 import torch.nn as nn
 import math
 import torch.optim as optim
@@ -27,7 +28,7 @@ class PositionalEncoding(nn.Module):
         return x + self.encoding[:seq_len, :].to(x.device)
 
 class ChessTransformer(nn.Module):
-    def __init__(self, embedding_dim=1280, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=64):
+    def __init__(self, embedding_dim=256, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=64):
         super(ChessTransformer, self).__init__()
         self.embedding = nn.Embedding(len(piece_to_int), embedding_dim)
         self.pos_encoder = PositionalEncoding(embedding_dim, max_len)
@@ -53,59 +54,89 @@ class InfoNCELoss(nn.Module):
         positive = F.normalize(positive, dim=-1)
         negatives = F.normalize(negatives, dim=-1)
 
-        pos_sim = torch.exp(torch.sum(anchor * positive, dim=-1) / self.temperature)
-        neg_sim = torch.exp(torch.mm(anchor, negatives.t()) / self.temperature)
+        print('normalized shapes:')
+        print(positive.shape)
+        print(negatives.shape)
+        pos_sim = torch.bmm(anchor.unsqueeze(1), positive.transpose(1, 2)) / self.temperature
+        neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2)) / self.temperature
 
-        denominator = pos_sim + torch.sum(neg_sim, dim=-1)
+        pos_sim = torch.exp(pos_sim).sum(dim=2)
+        neg_sim = torch.exp(neg_sim).sum(dim=2)
+
+        print('similarity shapes:')
+        print(neg_sim.shape)
+        print(pos_sim.shape)
+        denominator = pos_sim + neg_sim
 
         loss = -torch.log(pos_sim / denominator)
         return loss.mean()
 
 
-def train(model, dataloader, dataset, criterion, optimizer, num_epochs=10, num_contrasted_samples=100):
+def train(model, dataloader, dataset, criterion, optimizer, device, num_epochs=10, num_contrasted_samples=100):
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0.0
-        for sequence, evaluation in dataloader:
+        import time
+        for batch_index, (sequences, evaluations) in enumerate(dataloader):
+            before = time.time()
+            print('starting a batch')
+            sequences, evaluations = sequences.to(device), evaluations.to(device)
             optimizer.zero_grad()
 
-            anchor_embedding = model(sequence)
+            anchor_embeddings = model(sequences)
 
-            random_indices = random.sample(range(len(dataset)), num_contrasted_samples)
-            random_samples = [dataset[i] for i in random_indices]
-            random_sequences = torch.stack([sample[0] for sample in random_samples])
-            random_evals = torch.stack([sample[1] for sample in random_samples])
+            pos = []
+            neg = []
+            batch_size = sequences.size(0)
 
-            random_embeddings = model(random_sequences)
+            for i in range(batch_size):
+                pos_indices = [idx for idx, (seq, ev) in enumerate(dataset) if abs(ev - evaluations[i]) < 100]
+                neg_indices = [idx for idx, (seq, ev) in enumerate(dataset) if abs(ev - evaluations[i]) >= 100]
 
-            pos_mask = torch.abs(evaluation.unsqueeze(1) - random_evals.unsqueeze(0)) < 100
-            neg_mask = torch.abs(evaluation.unsqueeze(1) - random_evals.unsqueeze(0)) >= 100
+                # realistically will always be 100 / 2 = 50, but if dataset is smaller this will help
+                num_pos_neg = min(len(pos_indices), len(neg_indices), num_contrasted_samples // 2)
+                sampled_positives = random.sample(pos_indices, num_pos_neg)
+                sampled_negatives = random.sample(neg_indices, num_pos_neg)
 
-            if pos_mask.any() and neg_mask.any():
-                positive_indices = pos_mask.nonzero(as_tuple=True)[1]
-                negative_indices = neg_mask.nonzero(as_tuple=True)[1]
+                pos_sequences = [dataset[idx][0] for idx in sampled_positives]
+                neg_sequences = [dataset[idx][0] for idx in sampled_negatives]
 
-                positive_samples = random_embeddings[positive_indices]
-                negative_samples = random_embeddings[negative_indices]
+                pos_emb = model(torch.stack(pos_sequences).to(device))
+                neg_emb = model(torch.stack(neg_sequences).to(device))
 
-                loss = criterion(anchor_embedding, positive_samples, negative_samples)
-                loss.backward()
-                optimizer.step()
+                pos.append(pos_emb)
+                neg.append(neg_emb)
 
-                total_loss += loss.item()
-                print('did a sequence')
+            positives = torch.cat(pos, dim=0)
+            negatives = torch.cat(neg, dim=0)
+            print(positives.shape)
+            print(negatives.shape)
+
+            positives = positives.view(batch_size, 50, -1)
+            negatives = negatives.view(batch_size, 50, -1)
+            loss = criterion(anchor_embeddings, positives, negatives)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            after = time.time()
+            elapsed = after - before
+            print('took {elapsed} seconds')
+            print(f'Batch [{batch_index+1}/{len(dataloader)}]')
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
-    torch.save(model.state_dict(), 'chess_transformer_model.pth')
+    torch.save(model.state_dict(), '/data/hamaraa/model.pth')
 
 if __name__ == '__main__':
-    file_path = '/Volumes/andy/splits/chunk_1.json'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f'Using device: {device}')
+    file_path = 'f_name'
     evals, fens = get_data(file_path)
     dataset = ChessDataset(evals, fens)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
 
-    embedding_dim = 1280
-    model = ChessTransformer()
-    criterion = InfoNCELoss(temperature=0.07)
+    embedding_dim = 256
+    model = ChessTransformer().to(device)
+    criterion = InfoNCELoss(temperature=0.07).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    train(model, dataloader, dataset, criterion, optimizer)
+    train(model, dataloader, dataset, criterion, optimizer, device)

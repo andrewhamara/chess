@@ -42,7 +42,7 @@ def get_data(file_path):
                         fen = line_data.get('fen')
                         evaluation = line_data.get('evals', [{}])[0].get('pvs', [{}])[0].get('cp')
                         if fen and evaluation is not None:
-                            print(f'{fen} \t {evaluation}')
+                            #print(f'{fen} \t {evaluation}')
                             evals.append(evaluation)
                             fens.append(fen)
                 else:
