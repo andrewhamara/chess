@@ -14,6 +14,7 @@ piece_to_int = {
 def fen_to_sequence(fen):
     parts = fen.split()
     fen_board = parts[0]
+    turn = parts[1]
 
     sequence = []
 
@@ -24,6 +25,8 @@ def fen_to_sequence(fen):
                 sequence.extend([piece_to_int['.']] * int(char))
             else:
                 sequence.append(piece_to_int[char])
+
+    sequence.append(1 if turn == 'w' else 0)
 
     return sequence
 

@@ -12,7 +12,7 @@ from load_data import get_data, ChessDataset, piece_to_int
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=64):
+    def __init__(self, d_model, max_len=65):
         super(PositionalEncoding, self).__init__()
         self.encoding = torch.zeros(max_len, d_model)
         self.encoding.requires_grad = False
@@ -28,7 +28,7 @@ class PositionalEncoding(nn.Module):
         return x + self.encoding[:seq_len, :].to(x.device)
 
 class ChessTransformer(nn.Module):
-    def __init__(self, embedding_dim=256, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=64):
+    def __init__(self, embedding_dim=256, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=65):
         super(ChessTransformer, self).__init__()
         self.embedding = nn.Embedding(len(piece_to_int), embedding_dim)
         self.pos_encoder = PositionalEncoding(embedding_dim, max_len)
