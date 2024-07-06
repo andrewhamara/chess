@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 import torch
-#torch.cuda.empty_cache()
 import torch.nn as nn
 import math
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import random
+import os
+import time
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from load_data import get_data, ChessDataset, piece_to_int
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=65):
@@ -54,89 +60,120 @@ class InfoNCELoss(nn.Module):
         positive = F.normalize(positive, dim=-1)
         negatives = F.normalize(negatives, dim=-1)
 
-        print('normalized shapes:')
-        print(positive.shape)
-        print(negatives.shape)
         pos_sim = torch.bmm(anchor.unsqueeze(1), positive.transpose(1, 2)) / self.temperature
         neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2)) / self.temperature
 
         pos_sim = torch.exp(pos_sim).sum(dim=2)
         neg_sim = torch.exp(neg_sim).sum(dim=2)
 
-        print('similarity shapes:')
-        print(neg_sim.shape)
-        print(pos_sim.shape)
         denominator = pos_sim + neg_sim
 
         loss = -torch.log(pos_sim / denominator)
         return loss.mean()
 
+############################ Distributed setup and cleanup #####################
 
-def train(model, dataloader, dataset, criterion, optimizer, device, num_epochs=10, num_contrasted_samples=100):
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    print(f"Process {rank} set up with world size {world_size} and device {torch.cuda.current_device()}", flush=True)
+
+def cleanup():
+    dist.destroy_process_group()
+
+#################################################################################
+
+def find_pos_neg_samples(sequences, evaluations, target, num_contrasted_samples):
+    pos, neg = [], []
+
+    for idx, ev in enumerate(evaluations):
+        if abs(ev - target) < 100:
+            pos.append(idx)
+        else:
+            neg.append(idx)
+
+        if len(pos) >= num_contrasted_samples // 2 and len(neg) >= num_contrasted_samples // 2:
+            break
+
+    num_pos_neg = min(len(pos), len(neg), num_contrasted_samples // 2)
+    sampled_pos = random.sample(pos, num_pos_neg) if num_pos_neg > 0 else []
+    sampled_neg = random.sample(neg, num_pos_neg) if num_pos_neg > 0 else []
+
+    pos_sequences = [sequences[idx] for idx in sampled_pos]
+    neg_sequences = [sequences[idx] for idx in sampled_neg]
+
+    return pos_sequences, neg_sequences
+
+def train(rank, world_size, file_path, num_epochs=10, num_contrasted_samples=100):
+    setup(rank, world_size)
+    device = torch.device(f'cuda:{rank}')
+    print(f'Process {rank} using device {device}', flush=True)
+
+    evals, fens = get_data(file_path)
+    dataset = ChessDataset(evals, fens)
+    train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    dataloader = DataLoader(dataset, batch_size=16, sampler=train_sampler, num_workers=36)
+
+    model = ChessTransformer().to(device)
+    model = DDP(model, device_ids=[rank], output_device=rank)
+    
+    criterion = InfoNCELoss(temperature=0.07).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
     model.train()
+    dataset_size = len(dataset)
+
     for epoch in range(num_epochs):
         total_loss = 0.0
-        import time
         for batch_index, (sequences, evaluations) in enumerate(dataloader):
-            before = time.time()
-            print('starting a batch')
             sequences, evaluations = sequences.to(device), evaluations.to(device)
             optimizer.zero_grad()
 
             anchor_embeddings = model(sequences)
-
-            pos = []
-            neg = []
+            pos_sequences, neg_sequences = [], []
             batch_size = sequences.size(0)
 
-            for i in range(batch_size):
-                pos_indices = [idx for idx, (seq, ev) in enumerate(dataset) if abs(ev - evaluations[i]) < 100]
-                neg_indices = [idx for idx, (seq, ev) in enumerate(dataset) if abs(ev - evaluations[i]) >= 100]
+            for cur_chunk in range(0, dataset_size, 10000):
+                chunk_end = min(cur_chunk + 10000, dataset_size)
+                chunk_sequences = dataset.sequences[cur_chunk:chunk_end]
+                chunk_evals = dataset.evals[cur_chunk:chunk_end]
 
-                # realistically will always be 100 / 2 = 50, but if dataset is smaller this will help
-                num_pos_neg = min(len(pos_indices), len(neg_indices), num_contrasted_samples // 2)
-                sampled_positives = random.sample(pos_indices, num_pos_neg)
-                sampled_negatives = random.sample(neg_indices, num_pos_neg)
+                for i in range(len(evaluations)):
+                    target = evaluations[i].item()
+                    pos, neg = find_pos_neg_samples(chunk_sequences, chunk_evals, target, num_contrasted_samples)
+                    pos_sequences.extend(pos)
+                    neg_sequences.extend(neg)
 
-                pos_sequences = [dataset[idx][0] for idx in sampled_positives]
-                neg_sequences = [dataset[idx][0] for idx in sampled_negatives]
+                if len(pos_sequences) >= batch_size * (num_contrasted_samples // 2) and \
+                   len(neg_sequences) >= batch_size * (num_contrasted_samples // 2):
+                    break
 
-                pos_emb = model(torch.stack(pos_sequences).to(device))
-                neg_emb = model(torch.stack(neg_sequences).to(device))
+            pos_sequences = pos_sequences[:batch_size * (num_contrasted_samples // 2)]
+            neg_sequences = neg_sequences[:batch_size * (num_contrasted_samples // 2)]
 
-                pos.append(pos_emb)
-                neg.append(neg_emb)
+            pos_emb = model(torch.stack([torch.tensor(seq, dtype=torch.long).to(device) for seq in pos_sequences]))
+            neg_emb = model(torch.stack([torch.tensor(seq, dtype=torch.long).to(device) for seq in neg_sequences]))
 
-            positives = torch.cat(pos, dim=0)
-            negatives = torch.cat(neg, dim=0)
-            print(positives.shape)
-            print(negatives.shape)
-
-            positives = positives.view(batch_size, 50, -1)
-            negatives = negatives.view(batch_size, 50, -1)
+            positives = pos_emb.view(batch_size, num_contrasted_samples // 2, -1)
+            negatives = neg_emb.view(batch_size, num_contrasted_samples // 2, -1)
             loss = criterion(anchor_embeddings, positives, negatives)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            after = time.time()
-            elapsed = after - before
-            print('took {elapsed} seconds')
-            print(f'Batch [{batch_index+1}/{len(dataloader)}]')
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
-    torch.save(model.state_dict(), '/data/hamaraa/model.pth')
+            print(f'Batch [{batch_index+1}/{len(dataloader)}] completed by process {rank}', flush=True)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f} by process {rank}', flush=True)
+    cleanup()
+    if rank == 0:
+        torch.save(model.state_dict(), '/data/hamaraa/model_small.pth')
 
 if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f'Using device: {device}')
-    file_path = 'f_name'
-    evals, fens = get_data(file_path)
-    dataset = ChessDataset(evals, fens)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
-
-    embedding_dim = 256
-    model = ChessTransformer().to(device)
-    criterion = InfoNCELoss(temperature=0.07).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    train(model, dataloader, dataset, criterion, optimizer, device)
+    file_path = '/data/hamaraa/data.json'
+    world_size = torch.cuda.device_count()
+    print(f"World size: {world_size}", flush=True)
+    mp.spawn(train,
+             args=(world_size, file_path),
+             nprocs=world_size,
+             join=True)
