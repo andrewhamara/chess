@@ -45,7 +45,9 @@ class ChessTransformer(nn.Module):
     def forward(self, x):
         x = self.embedding(x) * math.sqrt(self.embedding.embedding_dim)
         x = self.pos_encoder(x)
+        x = x.permute(1, 0, 2)
         x = self.transformer_encoder(x)
+        x = x.permute(1, 0, 2)
         x = x.mean(dim=1)
         x = self.fc(x)
         return x
@@ -63,7 +65,7 @@ class InfoNCELoss(nn.Module):
         pos_sim = torch.bmm(anchor.unsqueeze(1), positive.transpose(1, 2)) / self.temperature
         neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2)) / self.temperature
 
-        pos_sim = torch.exp(pos_sim).sum(dim=2)
+        pos_sim = torch.exp(pos_sim).squeeze(1)
         neg_sim = torch.exp(neg_sim).sum(dim=2)
 
         denominator = pos_sim + neg_sim
@@ -85,43 +87,55 @@ def cleanup():
 
 #################################################################################
 
-def find_pos_neg_samples(sequences, evaluations, target, num_contrasted_samples):
-    pos, neg = [], []
+def find_pos_neg_samples(sequences, evaluations, target, num_negatives):
+    pos, neg = None, []
 
     for idx, ev in enumerate(evaluations):
-        if abs(ev - target) < 100:
-            pos.append(idx)
-        else:
+        if pos is None and abs(ev - target) < 100:
+            pos = idx
+        elif abs(ev - target) >= 100 and len(neg) < num_negatives:
             neg.append(idx)
-
-        if len(pos) >= num_contrasted_samples // 2 and len(neg) >= num_contrasted_samples // 2:
+        
+        if pos is not None and len(neg) == num_negatives:
             break
 
-    num_pos_neg = min(len(pos), len(neg), num_contrasted_samples // 2)
-    sampled_pos = random.sample(pos, num_pos_neg) if num_pos_neg > 0 else []
-    sampled_neg = random.sample(neg, num_pos_neg) if num_pos_neg > 0 else []
+    if pos is None or len(neg) < num_negatives:
+        return None, None
 
-    pos_sequences = [sequences[idx] for idx in sampled_pos]
-    neg_sequences = [sequences[idx] for idx in sampled_neg]
 
-    return pos_sequences, neg_sequences
+    pos_sequence = sequences[pos]
+    neg_sequences = [sequences[idx] for idx in neg]
 
-def train(rank, world_size, file_path, num_epochs=10, num_contrasted_samples=100):
+    return pos_sequence, neg_sequences
+
+def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=50):
+    print('setting up...', flush=True)
     setup(rank, world_size)
+
     device = torch.device(f'cuda:{rank}')
     print(f'Process {rank} using device {device}', flush=True)
 
+    print('getting data...', flush=True)
     evals, fens = get_data(file_path)
-    dataset = ChessDataset(evals, fens)
-    train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    dataloader = DataLoader(dataset, batch_size=16, sampler=train_sampler, num_workers=36)
 
+    print('Creating dataset...', flush=True)
+    dataset = ChessDataset(evals, fens)
+
+    print('creating sampler...', flush=True)
+    train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+
+    print('creating dataloader...', flush=True)
+    dataloader = DataLoader(dataset, batch_size=4, sampler=train_sampler, num_workers=4)
+
+    print('creating model...', flush=True)
     model = ChessTransformer().to(device)
     model = DDP(model, device_ids=[rank], output_device=rank)
     
+    print('creating loss and optimizer...', flush=True)
     criterion = InfoNCELoss(temperature=0.07).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
+    print('starting to train...', flush=True)
     model.train()
     dataset_size = len(dataset)
 
@@ -132,48 +146,64 @@ def train(rank, world_size, file_path, num_epochs=10, num_contrasted_samples=100
             optimizer.zero_grad()
 
             anchor_embeddings = model(sequences)
-            pos_sequences, neg_sequences = [], []
+            pos_embeddings_list, neg_embeddings_list = [], []
             batch_size = sequences.size(0)
 
-            for cur_chunk in range(0, dataset_size, 10000):
-                chunk_end = min(cur_chunk + 10000, dataset_size)
-                chunk_sequences = dataset.sequences[cur_chunk:chunk_end]
-                chunk_evals = dataset.evals[cur_chunk:chunk_end]
+            for i in range(batch_size):
+                target = evaluations[i].item()
+                cur_chunk = 0
+                negative_samples = []
+                positive_sample = None
+                positive_found = False
 
-                for i in range(len(evaluations)):
-                    target = evaluations[i].item()
-                    pos, neg = find_pos_neg_samples(chunk_sequences, chunk_evals, target, num_contrasted_samples)
-                    pos_sequences.extend(pos)
-                    neg_sequences.extend(neg)
+                while len(negative_samples) < num_negatives:
+                    chunk_end = min(cur_chunk + 10000, dataset_size)
+                    chunk_sequences = dataset.sequences[cur_chunk:chunk_end]
+                    chunk_evals = dataset.evals[cur_chunk:chunk_end]
+                    cur_chunk = chunk_end
 
-                if len(pos_sequences) >= batch_size * (num_contrasted_samples // 2) and \
-                   len(neg_sequences) >= batch_size * (num_contrasted_samples // 2):
-                    break
+                    pos_seq, neg_seqs = find_pos_neg_samples(chunk_sequences, chunk_evals, target, num_negatives - len(negative_samples))
+                    if pos_seq is not None and not positive_found:
+                        positive_sample = pos_seq
+                        positive_found = True
+                    if neg_seqs is not None:
+                        negative_samples.extend(neg_seqs)
 
-            pos_sequences = pos_sequences[:batch_size * (num_contrasted_samples // 2)]
-            neg_sequences = neg_sequences[:batch_size * (num_contrasted_samples // 2)]
+                    if cur_chunk >= dataset_size:
+                        break
 
-            pos_emb = model(torch.stack([torch.tensor(seq, dtype=torch.long).to(device) for seq in pos_sequences]))
-            neg_emb = model(torch.stack([torch.tensor(seq, dtype=torch.long).to(device) for seq in neg_sequences]))
+                if positive_found and len(negative_samples) == num_negatives:
+                    positive_embedding = model(torch.tensor(positive_sample, dtype=torch.long).unsqueeze(0).to(device))
+                    negative_embeddings = model(torch.stack([torch.tensor(seq, dtype=torch.long).to(device) for seq in negative_samples]))
 
-            positives = pos_emb.view(batch_size, num_contrasted_samples // 2, -1)
-            negatives = neg_emb.view(batch_size, num_contrasted_samples // 2, -1)
-            loss = criterion(anchor_embeddings, positives, negatives)
-            loss.backward()
-            optimizer.step()
+                    pos_embeddings_list.append(positive_embedding)
+                    neg_embeddings_list.append(negative_embeddings)
+
+            if len(pos_embeddings_list) == batch_size and len(neg_embeddings_list) == batch_size:
+
+                positive_embeddings = torch.cat(pos_embeddings_list, dim=0)
+                negative_embeddings = torch.cat(neg_embeddings_list, dim=0)
+                negative_embeddings = negative_embeddings.view(batch_size, num_negatives, -1)
+
+                loss = criterion(anchor_embeddings, positive_embeddings.unsqueeze(1), negative_embeddings)
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
             print(f'Batch [{batch_index+1}/{len(dataloader)}] completed by process {rank}', flush=True)
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f} by process {rank}', flush=True)
+        if rank == 0:
+            epoch_save_path = os.path.join(save_path, f'chess_small_{epoch+1}.pth')
+            torch.save(model.state_dict(), epoch_save_path)
+            print(f'Model saved at {epoch_save_path}', flush=True)
     cleanup()
-    if rank == 0:
-        torch.save(model.state_dict(), '/data/hamaraa/model_small.pth')
 
 if __name__ == '__main__':
-    file_path = '/data/hamaraa/data.json'
+    file_path = '/data/hamaraa/chess_1m.json'
+    save_path = '/data/hamaraa/model_checkpoints'
     world_size = torch.cuda.device_count()
     print(f"World size: {world_size}", flush=True)
     mp.spawn(train,
-             args=(world_size, file_path),
+             args=(world_size, file_path, save_path),
              nprocs=world_size,
              join=True)
