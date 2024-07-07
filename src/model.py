@@ -9,6 +9,9 @@ import random
 import os
 import time
 
+import numba
+from numba import jit, int32
+
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -34,7 +37,7 @@ class PositionalEncoding(nn.Module):
         return x + self.encoding[:seq_len, :].to(x.device)
 
 class ChessTransformer(nn.Module):
-    def __init__(self, embedding_dim=256, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=65):
+    def __init__(self, embedding_dim=768, nhead=8, num_encoder_layers=6, dim_feedforward=512, max_len=65):
         super(ChessTransformer, self).__init__()
         self.embedding = nn.Embedding(len(piece_to_int), embedding_dim)
         self.pos_encoder = PositionalEncoding(embedding_dim, max_len)
@@ -88,27 +91,27 @@ def cleanup():
 #################################################################################
 
 def find_pos_neg_samples(sequences, evaluations, target, num_negatives):
-    pos, neg = None, []
+    pos = -1
+    neg = []
 
-    for idx, ev in enumerate(evaluations):
+    for idx in range(len(evaluations)):
+        ev = evaluations[idx]
         if pos is None and abs(ev - target) < 100:
             pos = idx
         elif abs(ev - target) >= 100 and len(neg) < num_negatives:
             neg.append(idx)
-        
         if pos is not None and len(neg) == num_negatives:
             break
 
     if pos is None or len(neg) < num_negatives:
         return None, None
 
-
     pos_sequence = sequences[pos]
     neg_sequences = [sequences[idx] for idx in neg]
 
     return pos_sequence, neg_sequences
 
-def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=50):
+def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=100):
     print('setting up...', flush=True)
     setup(rank, world_size)
 
@@ -120,17 +123,20 @@ def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=5
 
     print('Creating dataset...', flush=True)
     dataset = ChessDataset(evals, fens)
+    print(len(dataset))
 
     print('creating sampler...', flush=True)
     train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
 
     print('creating dataloader...', flush=True)
-    dataloader = DataLoader(dataset, batch_size=4, sampler=train_sampler, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=64, sampler=train_sampler, num_workers=8, pin_memory=True, prefetch_factor=8, persistent_workers=True)
+
+    print(f'Process {rank} is handling {len(train_sampler)} samples', flush=True)
 
     print('creating model...', flush=True)
     model = ChessTransformer().to(device)
     model = DDP(model, device_ids=[rank], output_device=rank)
-    
+
     print('creating loss and optimizer...', flush=True)
     criterion = InfoNCELoss(temperature=0.07).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -140,9 +146,12 @@ def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=5
     dataset_size = len(dataset)
 
     for epoch in range(num_epochs):
+        train_sampler.set_epoch(epoch)
         total_loss = 0.0
         for batch_index, (sequences, evaluations) in enumerate(dataloader):
-            sequences, evaluations = sequences.to(device), evaluations.to(device)
+            if batch_index == 0:
+                print(evaluations)
+            sequences, evaluations = sequences.to(device, non_blocking=True), evaluations.to(device, non_blocking=True)
             optimizer.zero_grad()
 
             anchor_embeddings = model(sequences)
@@ -190,19 +199,21 @@ def train(rank, world_size, file_path, save_path, num_epochs=10, num_negatives=5
                 optimizer.step()
 
             total_loss += loss.item()
-            print(f'Batch [{batch_index+1}/{len(dataloader)}] completed by process {rank}', flush=True)
+            if batch_index % 1000 == 0:
+                print(f'Batch [{batch_index+1}/{len(dataloader)}] completed by process {rank}', flush=True)
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f} by process {rank}', flush=True)
         if rank == 0:
             epoch_save_path = os.path.join(save_path, f'chess_small_{epoch+1}.pth')
-            torch.save(model.state_dict(), epoch_save_path)
+            torch.save(model.module.state_dict(), epoch_save_path)
             print(f'Model saved at {epoch_save_path}', flush=True)
     cleanup()
 
 if __name__ == '__main__':
-    file_path = '/data/hamaraa/chess_1m.json'
+    file_path = '/data/hamaraa/data.json'
     save_path = '/data/hamaraa/model_checkpoints'
     world_size = torch.cuda.device_count()
     print(f"World size: {world_size}", flush=True)
+    mp.set_start_method('fork')
     mp.spawn(train,
              args=(world_size, file_path, save_path),
              nprocs=world_size,

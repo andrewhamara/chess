@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import torch
-import json
 import os
+import orjson
+import numpy as np
 from torch.utils.data import Dataset
+import mmap
 
 
 piece_to_int = {
@@ -16,17 +18,18 @@ def fen_to_sequence(fen):
     fen_board = parts[0]
     turn = parts[1]
 
-    sequence = []
+    sequence = np.zeros(65, dtype=np.int8)
 
-    rows = fen_board.split('/')
-    for row in rows:
-        for char in row:
+    index = 0
+    for char in fen_board:
+        if char != '/':
             if char.isdigit():
-                sequence.extend([piece_to_int['.']] * int(char))
+                index += int(char)
             else:
-                sequence.append(piece_to_int[char])
+                sequence[index] = piece_to_int[char]
+                index += 1
 
-    sequence.append(1 if turn == 'w' else 0)
+    sequence[64] = 1 if turn == 'w' else 0
 
     return sequence
 
@@ -36,33 +39,31 @@ def get_data(file_path):
     fens = []
     evals = []
     if os.path.isfile(file_path):
-        with open(file_path, 'r') as file:
-            try:
-                lines = file.readlines()
-                if lines:
-                    for line in lines:
-                        line_data = json.loads(line)
-                        fen = line_data.get('fen')
-                        evaluation = line_data.get('evals', [{}])[0].get('pvs', [{}])[0].get('cp')
-                        if fen and evaluation is not None:
-                            #print(f'{fen} \t {evaluation}')
-                            evals.append(evaluation)
-                            fens.append(fen)
-                else:
-                    print(f"The JSON file {file_path} is empty.")
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON in {file_path}: {e}")
+        with open(file_path, 'r+b') as file:
+            mmapped_file = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+            for line in iter(mmapped_file.readline, b""):
+                try:
+                    line_data = orjson.loads(line)
+                    fen = line_data.get('fen')
+                    evaluation = line_data.get('evals', [{}])[0].get('pvs', [{}])[0].get('cp')
+                    if fen and evaluation is not None:
+                        evals.append(evaluation)
+                        fens.append(fen)
+                except orjson.JSONDecodeError as e:
+                    print(f'Error decoding JSON in {file_path}: {e}')
+            mmapped_file.close()
     return evals, fens
 
 class ChessDataset(Dataset):
     def __init__(self, evals, fens):
         self.evals = evals
         self.fens = fens
+        self.sequences = np.array([fen_to_sequence(fen) for fen in self.fens], dtype=np.int8)
 
     def __len__(self):
         return len(self.evals)
 
     def __getitem__(self, idx):
-        sequence = fen_to_sequence(self.fens[idx])
+        sequence = self.sequences[idx]
         evaluation = self.evals[idx]
         return torch.tensor(sequence, dtype=torch.long), torch.tensor(evaluation, dtype=torch.float32)
